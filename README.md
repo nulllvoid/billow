@@ -16,10 +16,14 @@ It handles plan management, subscriber lifecycle (subscribe / cancel / pause / r
 
 - **Plan CRUD** — create, list, update, and archive subscription plans
 - **Full subscription lifecycle** — subscribe, cancel (immediately or at period-end), pause, resume, upgrade/downgrade
-- **Metered usage tracking** — record usage events, sum per billing period, enforce plan limits
+- **Metered usage tracking** — record usage events, sum per billing period, enforce plan limits with `CheckLimit` / `CheckLimits` (batch)
 - **Webhook dispatch** — parse, normalise, and fan-out provider webhook events to your handlers
+- **Async webhook dispatch** — optional worker pool routes events by subscription ID, preserving per-subscription ordering
+- **Persist-then-report usage** — usage records are written locally first; a background sweeper reports them to the provider crash-safely
+- **Cursor-based pagination** — `ListPlansPage` / `ListSubscriptionsPage` with opaque cursors
 - **Provider-agnostic** — implement one interface for Stripe, Razorpay, or any other gateway
-- **Pluggable persistence** — ships with an in-memory store; bring your own Postgres / Mongo / DynamoDB adapter
+- **Pluggable persistence** — ships with an in-memory store and a 256-shard high-throughput variant; bring your own Postgres / Mongo / DynamoDB adapter
+- **Instrumentation hooks** — optional `Metrics` interface for Prometheus, Datadog, or any custom backend
 - **Zero external dependencies** — only the Go standard library
 
 ---
@@ -55,8 +59,9 @@ func main() {
         Subs:     memory.NewSubscriptionStore(),
         Usage:    memory.NewUsageStore(),
     })
+    defer mgr.Close() // drains background goroutines on shutdown
 
-    // Register webhook handlers.
+    // Register webhook handlers (safe to call at any time, from any goroutine).
     mgr.OnWebhookEvent(billow.EventPaymentFailed, func(e *billow.WebhookEvent) error {
         log.Printf("payment failed for %s", e.Subscription.SubscriberID)
         return nil
@@ -80,14 +85,21 @@ func main() {
         PlanID:       pro.ID,
     })
 
-    // Record usage and check limits.
+    // Record usage and check a single limit.
     mgr.RecordUsage(ctx, billow.RecordUsageInput{
         SubscriptionID: sub.ID,
         Metric:         "api_calls",
         Quantity:       250,
     })
-
     if err := mgr.CheckLimit(ctx, sub.ID, "api_calls", 1); err != nil {
+        log.Println("limit exceeded:", err)
+    }
+
+    // Check multiple limits in one call (single subscription + plan fetch).
+    if err := mgr.CheckLimits(ctx, billow.CheckLimitsInput{
+        SubscriptionID: sub.ID,
+        Deltas:         map[string]int64{"api_calls": 100, "seats": 1},
+    }); err != nil {
         log.Println("limit exceeded:", err)
     }
 
@@ -111,14 +123,58 @@ See [examples/basic/](examples/basic/) for a fully working demo using a mock pro
 ## Architecture
 
 ```
-billow.Manager          ← main entry point (plan + subscription + usage + webhook)
-├── provider.PaymentProvider   ← implement once per payment gateway
-├── store.PlanStore            ← persist plans
-├── store.SubscriptionStore    ← persist subscriptions
-└── store.UsageStore           ← persist metered usage records
+billow.Manager               ← main entry point
+├── provider.PaymentProvider ← implement once per payment gateway
+├── store.PlanStore          ← persist plans
+├── store.SubscriptionStore  ← persist subscriptions
+├── store.UsageStore         ← persist metered usage records
+├── dispatchPool             ← optional async webhook worker pool
+├── usageReporter            ← optional persist-then-report sweeper
+└── planCache                ← in-process TTL cache for hot CheckLimit path
 
-store/memory/           ← in-memory implementations (testing / prototyping)
-examples/basic/         ← end-to-end demo
+store/memory/
+├── PlanStore                ← simple mutex-guarded map
+├── SubscriptionStore        ← RWMutex + secondary indexes (O(1) lookups)
+├── ShardedSubscriptionStore ← 256-shard variant for high write throughput
+└── UsageStore               ← nested [subID][metric] index (O(k) SumUsage)
+
+examples/basic/              ← end-to-end demo
+```
+
+---
+
+## Options reference
+
+```go
+billow.NewManager(billow.Options{
+    // Required
+    Provider: myProvider,          // payment gateway adapter
+    Plans:    memory.NewPlanStore(),
+    Subs:     memory.NewSubscriptionStore(),
+    Usage:    memory.NewUsageStore(),
+
+    // ID generation (default: time-ordered UUID v7 via crypto/rand)
+    IDGenerator: func() string { ... },
+
+    // Webhook event mapping (default: built-in Stripe + Razorpay map)
+    // Set to replace built-ins entirely; call BuiltinEventTypes() to extend them.
+    EventTypeMapper: func(providerType string) billow.WebhookEventType { ... },
+
+    // Plan cache (default: 5 min TTL; set negative to disable)
+    PlanCacheTTL: 10 * time.Minute,
+
+    // Async webhook dispatch (default: 0 = synchronous)
+    DispatchWorkers:    16,  // goroutines; events for same sub always on same worker
+    DispatchQueueDepth: 256, // per-worker channel buffer
+
+    // Persist-then-report usage sweeper
+    // Active only when Usage implements store.ReportableUsageStore and Provider is set.
+    UsageReportInterval: 30 * time.Second,
+    UsageReportBatch:    100,
+
+    // Instrumentation (default: no-op)
+    Metrics: myPrometheusMetrics, // implements billow.Metrics
+})
 ```
 
 ---
@@ -144,7 +200,7 @@ type PaymentProvider interface {
 }
 ```
 
-The built-in webhook handler maps common **Stripe** and **Razorpay** event names to canonical `WebhookEventType` constants. Unknown event names pass through as-is.
+The built-in webhook handler maps common **Stripe** and **Razorpay** event names to canonical `WebhookEventType` constants. Unknown event names pass through as-is. Call `BuiltinEventTypes()` to get the default map and extend or replace it via `Options.EventTypeMapper`.
 
 ---
 
@@ -162,6 +218,72 @@ The built-in webhook handler maps common **Stripe** and **Razorpay** event names
 | `EventPaymentFailed` | `invoice.payment_failed` | — |
 | `EventTrialEnding` | `customer.subscription.trial_will_end` | — |
 | `EventTrialEnded` | — | — |
+
+---
+
+## Persistence store interfaces
+
+billow ships with two in-memory `SubscriptionStore` implementations:
+
+| Type | Use case |
+|---|---|
+| `memory.NewSubscriptionStore()` | Development, testing, single-instance deployments |
+| `memory.NewShardedSubscriptionStore()` | High-throughput scenarios; 256 independent shards eliminate single-mutex contention |
+
+Both implement `store.AtomicSubscriptionStore`, enabling the TOCTOU-safe subscribe path automatically.
+
+For production, implement `store.PlanStore`, `store.SubscriptionStore`, and `store.UsageStore` against your database. To enable crash-safe provider usage reporting, also implement `store.ReportableUsageStore`.
+
+---
+
+## Pagination
+
+```go
+// First page
+page, _ := mgr.ListPlansPage(ctx, billow.ListPlansPageInput{
+    ActiveOnly: true,
+    Limit:      20,
+})
+for _, p := range page.Items { ... }
+
+// Next page
+if page.NextCursor != "" {
+    page2, _ := mgr.ListPlansPage(ctx, billow.ListPlansPageInput{
+        ActiveOnly: true,
+        Limit:      20,
+        Cursor:     page.NextCursor,
+    })
+}
+```
+
+`ListSubscriptionsPage` works identically and supports `SubscriberID`, `PlanID`, and `Status` filters.
+
+---
+
+## Instrumentation
+
+Implement `billow.Metrics` and pass it via `Options.Metrics`:
+
+```go
+type Metrics interface {
+    DispatchDuration(eventType string, success bool, d time.Duration)
+    UsageReportDuration(metric string, success bool, d time.Duration)
+    PlanCacheHit(hit bool)
+    WorkerQueueDepth(workerIndex int, depth int)
+}
+```
+
+When `nil`, all calls are no-ops with zero allocations.
+
+---
+
+## Graceful shutdown
+
+```go
+// Call Close once at application shutdown.
+// Waits for the dispatch pool to drain and the usage reporter to flush.
+mgr.Close()
+```
 
 ---
 

@@ -78,7 +78,7 @@ func (m *Manager) CheckLimit(ctx context.Context, subscriptionID, metric string,
 		return err
 	}
 
-	sp, err := m.plans.GetPlan(ctx, ss.PlanID)
+	plan, err := m.getPlanCached(ctx, ss.PlanID)
 	if err != nil {
 		if isNotFound(err) {
 			return ErrPlanNotFound
@@ -86,7 +86,7 @@ func (m *Manager) CheckLimit(ctx context.Context, subscriptionID, metric string,
 		return err
 	}
 
-	limit, hasLimit := sp.Limits[metric]
+	limit, hasLimit := plan.Limits[metric]
 	if !hasLimit || limit == 0 {
 		return nil // unlimited
 	}
@@ -99,6 +99,52 @@ func (m *Manager) CheckLimit(ctx context.Context, subscriptionID, metric string,
 	if current+delta > limit {
 		return fmt.Errorf("%w: %s (current=%d, limit=%d, requested=%d)",
 			ErrUsageLimitExceeded, metric, current, limit, delta)
+	}
+	return nil
+}
+
+// CheckLimitsInput is the input for a batch limit check across multiple metrics.
+type CheckLimitsInput struct {
+	SubscriptionID string
+	// Deltas maps metric name to the quantity about to be consumed.
+	// Metrics absent from the plan's Limits map (or with limit 0) are skipped.
+	Deltas map[string]int64
+}
+
+// CheckLimits checks all supplied metrics in a single store round-trip.
+// It fetches the subscription and plan once, then fans out SumUsage calls
+// for only the metrics that have a non-zero limit on the plan.
+// Returns the first ErrUsageLimitExceeded encountered, or nil if all pass.
+func (m *Manager) CheckLimits(ctx context.Context, in CheckLimitsInput) error {
+	ss, err := m.subs.GetSubscription(ctx, in.SubscriptionID)
+	if err != nil {
+		if isNotFound(err) {
+			return ErrSubscriptionNotFound
+		}
+		return err
+	}
+
+	plan, err := m.getPlanCached(ctx, ss.PlanID)
+	if err != nil {
+		if isNotFound(err) {
+			return ErrPlanNotFound
+		}
+		return err
+	}
+
+	for metric, delta := range in.Deltas {
+		limit, hasLimit := plan.Limits[metric]
+		if !hasLimit || limit == 0 {
+			continue // unlimited
+		}
+		current, err := m.usage.SumUsage(ctx, in.SubscriptionID, metric, ss.CurrentPeriodStart, ss.CurrentPeriodEnd)
+		if err != nil {
+			return err
+		}
+		if current+delta > limit {
+			return fmt.Errorf("%w: %s (current=%d, limit=%d, requested=%d)",
+				ErrUsageLimitExceeded, metric, current, limit, delta)
+		}
 	}
 	return nil
 }
@@ -131,22 +177,24 @@ func (m *Manager) GetUsageReport(ctx context.Context, subscriptionID string) ([]
 
 func usageToStore(u *UsageRecord) *store.UsageRecord {
 	return &store.UsageRecord{
-		ID:             u.ID,
-		SubscriptionID: u.SubscriptionID,
-		Metric:         u.Metric,
-		Quantity:       u.Quantity,
-		RecordedAt:     u.RecordedAt,
-		Metadata:       u.Metadata,
+		ID:                 u.ID,
+		SubscriptionID:     u.SubscriptionID,
+		Metric:             u.Metric,
+		Quantity:           u.Quantity,
+		RecordedAt:         u.RecordedAt,
+		Metadata:           u.Metadata,
+		ProviderReportedAt: u.ProviderReportedAt,
 	}
 }
 
 func usageFromStore(u *store.UsageRecord) *UsageRecord {
 	return &UsageRecord{
-		ID:             u.ID,
-		SubscriptionID: u.SubscriptionID,
-		Metric:         u.Metric,
-		Quantity:       u.Quantity,
-		RecordedAt:     u.RecordedAt,
-		Metadata:       u.Metadata,
+		ID:                 u.ID,
+		SubscriptionID:     u.SubscriptionID,
+		Metric:             u.Metric,
+		Quantity:           u.Quantity,
+		RecordedAt:         u.RecordedAt,
+		Metadata:           u.Metadata,
+		ProviderReportedAt: u.ProviderReportedAt,
 	}
 }

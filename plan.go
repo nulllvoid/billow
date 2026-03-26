@@ -69,19 +69,25 @@ func (m *Manager) CreatePlan(ctx context.Context, in CreatePlanInput) (*Plan, er
 	if err := m.plans.SavePlan(ctx, planToStore(plan)); err != nil {
 		return nil, err
 	}
+	// Eagerly populate cache so the first CheckLimit after creation is a hit.
+	if m.planCache != nil {
+		m.planCache.set(plan)
+	}
 	return plan, nil
 }
 
-// GetPlan returns a plan by its internal ID.
+// GetPlan returns a plan by its internal ID. Served from the in-process cache
+// when available; the cache is always consistent with the store for plans
+// mutated through this Manager.
 func (m *Manager) GetPlan(ctx context.Context, id string) (*Plan, error) {
-	sp, err := m.plans.GetPlan(ctx, id)
+	plan, err := m.getPlanCached(ctx, id)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, ErrPlanNotFound
 		}
 		return nil, err
 	}
-	return planFromStore(sp), nil
+	return plan, nil
 }
 
 // ListPlans returns all plans. Pass activeOnly = true to exclude archived plans.
@@ -139,6 +145,11 @@ func (m *Manager) UpdatePlan(ctx context.Context, id string, in UpdatePlanInput)
 	if err := m.plans.SavePlan(ctx, planToStore(plan)); err != nil {
 		return nil, err
 	}
+	// Overwrite stale cache entry — avoids a thundering-herd window where
+	// concurrent CheckLimit calls all miss and hit the store simultaneously.
+	if m.planCache != nil {
+		m.planCache.set(plan)
+	}
 	return plan, nil
 }
 
@@ -159,5 +170,13 @@ func (m *Manager) DeletePlan(ctx context.Context, id string) error {
 		}
 	}
 
-	return m.plans.DeletePlan(ctx, id)
+	if err := m.plans.DeletePlan(ctx, id); err != nil {
+		return err
+	}
+	// Evict stale cache entry immediately so concurrent CheckLimit calls don't
+	// serve data for a plan that no longer exists.
+	if m.planCache != nil {
+		m.planCache.delete(id)
+	}
+	return nil
 }

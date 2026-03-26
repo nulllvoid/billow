@@ -2,6 +2,7 @@ package billow
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/nulllvoid/billow/store"
@@ -17,16 +18,12 @@ type SubscribeInput struct {
 // Subscribe creates a new subscription for a subscriber on the given plan.
 // Returns ErrAlreadySubscribed if the subscriber already has an active
 // or trialing subscription.
+//
+// When the configured store implements store.AtomicSubscriptionStore, the
+// duplicate-subscriber check and the insert are performed atomically,
+// eliminating the TOCTOU race. Otherwise a best-effort two-step check is
+// used (safe for single-instance deployments).
 func (m *Manager) Subscribe(ctx context.Context, in SubscribeInput) (*Subscription, error) {
-	// Guard: one active subscription per subscriber.
-	_, err := m.subs.GetActiveSubscription(ctx, in.SubscriberID)
-	if err == nil {
-		return nil, ErrAlreadySubscribed
-	}
-	if !isNotFound(err) {
-		return nil, err
-	}
-
 	sp, err := m.plans.GetPlan(ctx, in.PlanID)
 	if err != nil {
 		if isNotFound(err) {
@@ -69,8 +66,28 @@ func (m *Manager) Subscribe(ctx context.Context, in SubscribeInput) (*Subscripti
 		sub.ProviderID = providerID
 	}
 
-	if err := m.subs.SaveSubscription(ctx, subToStore(sub)); err != nil {
-		return nil, err
+	if m.atomicSubs != nil {
+		// Atomic path: check + insert under a single store-level lock.
+		// Eliminates the TOCTOU race for both single- and multi-instance deployments.
+		if err := m.atomicSubs.CreateSubscriptionIfNotActive(ctx, subToStore(sub)); err != nil {
+			var alreadyExists *store.ErrAlreadyExists
+			if errors.As(err, &alreadyExists) {
+				return nil, ErrAlreadySubscribed
+			}
+			return nil, err
+		}
+	} else {
+		// Fallback two-step path — safe for single-instance, racy across instances.
+		_, err := m.subs.GetActiveSubscription(ctx, in.SubscriberID)
+		if err == nil {
+			return nil, ErrAlreadySubscribed
+		}
+		if !isNotFound(err) {
+			return nil, err
+		}
+		if err := m.subs.SaveSubscription(ctx, subToStore(sub)); err != nil {
+			return nil, err
+		}
 	}
 	return sub, nil
 }

@@ -80,12 +80,15 @@ func (s *Subscription) IsActive() bool {
 
 // UsageRecord tracks a single metered usage event.
 type UsageRecord struct {
-	ID             string
-	SubscriptionID string
-	Metric         string            // e.g. "api_calls", "seats", "gb_storage"
-	Quantity       int64
-	RecordedAt     time.Time
-	Metadata       map[string]string
+	ID                 string
+	SubscriptionID     string
+	Metric             string            // e.g. "api_calls", "seats", "gb_storage"
+	Quantity           int64
+	RecordedAt         time.Time
+	Metadata           map[string]string
+	// ProviderReportedAt is non-nil once this record has been successfully
+	// pushed to the payment provider. Nil means the report is still pending.
+	ProviderReportedAt *time.Time
 }
 
 // ---------------------------------------------------------------------------

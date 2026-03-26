@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	billow "github.com/nulllvoid/billow"
 )
@@ -152,6 +153,7 @@ func TestUpdatePlan(t *testing.T) {
 	ctx := context.Background()
 	created := createTestPlan(t, mgr)
 
+	time.Sleep(2 * time.Millisecond) // ensure UpdatedAt is strictly after CreatedAt
 	newName := "Pro Plus"
 	newDesc := "Even better"
 	updated, err := mgr.UpdatePlan(ctx, created.ID, billow.UpdatePlanInput{

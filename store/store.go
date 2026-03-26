@@ -71,12 +71,16 @@ type Subscription struct {
 
 // UsageRecord is a single metered usage event.
 type UsageRecord struct {
-	ID             string
-	SubscriptionID string
-	Metric         string
-	Quantity       int64
-	RecordedAt     time.Time
-	Metadata       map[string]string
+	ID                 string
+	SubscriptionID     string
+	Metric             string
+	Quantity           int64
+	RecordedAt         time.Time
+	Metadata           map[string]string
+	// ProviderReportedAt is set (non-zero) once the record has been
+	// successfully reported to the payment provider. A zero value means the
+	// record is pending reporting. Used by the persist-then-report sweeper.
+	ProviderReportedAt *time.Time
 }
 
 // ---------------------------------------------------------------------------
@@ -137,3 +141,42 @@ type UsageStore interface {
 type ErrNotFound struct{ Entity string }
 
 func (e *ErrNotFound) Error() string { return "store: " + e.Entity + " not found" }
+
+// ErrAlreadyExists is returned by atomic store operations (e.g.
+// CreateSubscriptionIfNotActive) when the record already exists.
+type ErrAlreadyExists struct{ Entity string }
+
+func (e *ErrAlreadyExists) Error() string { return "store: " + e.Entity + " already exists" }
+
+// ReportableUsageStore is an optional extension of UsageStore for the
+// persist-then-report pattern. Implementations that want crash-safe provider
+// reporting should implement this interface.
+//
+// The Manager detects it at construction time via type assertion. When absent
+// the usage reporter falls back to fire-and-forget (same as before).
+type ReportableUsageStore interface {
+	UsageStore
+	// ListUnreportedUsage returns up to limit records that have not yet been
+	// reported to the provider (ProviderReportedAt is nil/zero).
+	ListUnreportedUsage(ctx context.Context, limit int) ([]*UsageRecord, error)
+	// MarkUsageReported sets ProviderReportedAt = reportedAt for the given record ID.
+	MarkUsageReported(ctx context.Context, id string, reportedAt time.Time) error
+}
+
+// AtomicSubscriptionStore is an optional extension of SubscriptionStore that
+// provides an atomic check-and-insert for the subscribe guard. Implementations
+// that embed a real database SHOULD implement this interface using a transaction
+// or conditional write (Postgres: INSERT … WHERE NOT EXISTS; DynamoDB: conditional
+// PutItem) to eliminate the TOCTOU race between the duplicate-subscriber check
+// and the insert.
+//
+// The Manager detects this interface at construction time via type assertion.
+// Store adapters that do not implement it fall back to a two-step check+save,
+// which is safe for single-instance deployments but racy in multi-instance ones.
+type AtomicSubscriptionStore interface {
+	SubscriptionStore
+	// CreateSubscriptionIfNotActive inserts sub only when no active or trialing
+	// subscription already exists for sub.SubscriberID. Returns *ErrAlreadyExists
+	// on conflict. The check and insert MUST be atomic.
+	CreateSubscriptionIfNotActive(ctx context.Context, sub *Subscription) error
+}

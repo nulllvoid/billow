@@ -99,7 +99,7 @@ func (m *Manager) applyEventToSubscription(sub *Subscription, event *WebhookEven
 		return true
 
 	case EventPaymentSucceeded:
-		if sub.Status == StatusPastDue {
+		if sub.Status == StatusPastDue || sub.Status == StatusTrialing {
 			sub.Status = StatusActive
 			return true
 		}
@@ -113,55 +113,50 @@ func (m *Manager) applyEventToSubscription(sub *Subscription, event *WebhookEven
 	return false
 }
 
-// dispatch calls all registered handlers for the event's type.
-func (m *Manager) dispatch(event *WebhookEvent) error {
-	for _, h := range m.handlers[event.Type] {
-		if err := h(event); err != nil {
-			return err
-		}
+// mapEventType converts a provider-native event name to a canonical
+// WebhookEventType. Uses Options.EventTypeMapper when set, otherwise
+// falls back to the built-in Stripe/Razorpay map. Unknown names pass
+// through as-is.
+func (m *Manager) mapEventType(providerType string) WebhookEventType {
+	if m.eventTypeMapper != nil {
+		return m.eventTypeMapper(providerType)
 	}
-	return nil
+	if t, ok := m.eventTypes[providerType]; ok {
+		return t
+	}
+	return WebhookEventType(providerType)
 }
 
-// mapEventType converts a provider-native event name to a canonical
-// WebhookEventType. The default implementation handles common Stripe names;
-// override by embedding Manager or extending this method in your own package.
-func (m *Manager) mapEventType(providerType string) WebhookEventType {
-	switch providerType {
-	// Stripe names
-	case "customer.subscription.created":
-		return EventSubscriptionCreated
-	case "customer.subscription.updated":
-		return EventSubscriptionUpdated
-	case "customer.subscription.deleted":
-		return EventSubscriptionCanceled
-	case "customer.subscription.paused":
-		return EventSubscriptionPaused
-	case "customer.subscription.resumed":
-		return EventSubscriptionResumed
-	case "invoice.payment_succeeded":
-		return EventPaymentSucceeded
-	case "invoice.payment_failed":
-		return EventPaymentFailed
-	case "customer.subscription.trial_will_end":
-		return EventTrialEnding
-
-	// Razorpay names
-	case "subscription.activated":
-		return EventSubscriptionCreated
-	case "subscription.charged":
-		return EventPaymentSucceeded
-	case "subscription.cancelled":
-		return EventSubscriptionCanceled
-	case "subscription.paused":
-		return EventSubscriptionPaused
-	case "subscription.resumed":
-		return EventSubscriptionResumed
-	case "subscription.completed":
-		return EventSubscriptionCanceled
-
-	default:
-		return WebhookEventType(providerType)
+// BuiltinEventTypes returns a fresh copy of the default Stripe and Razorpay
+// event-name → WebhookEventType mappings. Use this as a starting point when
+// constructing a custom Options.EventTypeMapper:
+//
+//	m := billow.BuiltinEventTypes()
+//	m["paddle.subscription.created"] = billow.EventSubscriptionCreated
+//	mgr := billow.NewManager(billow.Options{
+//	    EventTypeMapper: func(t string) billow.WebhookEventType {
+//	        if v, ok := m[t]; ok { return v }
+//	        return billow.WebhookEventType(t)
+//	    },
+//	})
+func BuiltinEventTypes() map[string]WebhookEventType {
+	return map[string]WebhookEventType{
+		// Stripe
+		"customer.subscription.created":       EventSubscriptionCreated,
+		"customer.subscription.updated":       EventSubscriptionUpdated,
+		"customer.subscription.deleted":       EventSubscriptionCanceled,
+		"customer.subscription.paused":        EventSubscriptionPaused,
+		"customer.subscription.resumed":       EventSubscriptionResumed,
+		"invoice.payment_succeeded":           EventPaymentSucceeded,
+		"invoice.payment_failed":              EventPaymentFailed,
+		"customer.subscription.trial_will_end": EventTrialEnding,
+		// Razorpay
+		"subscription.activated": EventSubscriptionCreated,
+		"subscription.charged":   EventPaymentSucceeded,
+		"subscription.cancelled": EventSubscriptionCanceled,
+		"subscription.paused":    EventSubscriptionPaused,
+		"subscription.resumed":   EventSubscriptionResumed,
+		"subscription.completed": EventSubscriptionCanceled,
 	}
 }
 
